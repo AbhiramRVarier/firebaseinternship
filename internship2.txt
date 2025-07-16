@@ -1,0 +1,172 @@
+#include <WiFi.h>
+#include <ESP32Ping.h>
+#include <Firebase_ESP_Client.h>
+
+// --- Wind Direction Sensor Configuration ---
+#define WIND_DIR_PIN 32
+int sensorMin[] = {0, 99, 195, 302, 485, 662, 812, 931};
+int sensorMax[] = {98, 194, 301, 484, 661, 811, 930, 1023};
+const char* dirCard[] = {"SE", "S", "SW", "E", "W", "NE", "N", "NW"};
+
+// --- Anemometer (Wind Speed) Configuration ---
+#define ANEMOMETER_PIN 26
+#define DEBOUNCE_TIME 15            // in milliseconds
+#define CALC_INTERVAL 1000          // in milliseconds (1 second)
+
+volatile int anemometerCounter = 0;
+volatile unsigned long lastMicros = 0;
+
+unsigned long nextCalc = 0;
+float windSpeed = 0.0;
+
+// --- Wi-Fi Credentials ---
+const char* ssid = "Redmi 12 5G";
+const char* password = "asdfghjkl";
+
+// --- Firebase Configuration ---
+#define API_KEY "AIzaSyBfuZuKMfYydDAic6BXhHXWqrftBDYhBOg"
+#define DATABASE_URL "https://weaths-655b7-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL "abcd@gmail.com"
+#define USER_PASSWORD "A12345"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool internetOK = false;
+int dirIndex = -1;
+
+// --- Interrupt Service Routine for Anemometer ---
+void IRAM_ATTR countAnemometer() {
+  if ((long)(micros() - lastMicros) >= DEBOUNCE_TIME * 1000) {
+    anemometerCounter++;
+    lastMicros = micros();
+  }
+}
+
+// --- Calculate Wind Speed (m/s) ---
+float readWindSpeed() {
+  float speed = anemometerCounter * 0.6667; // 0.6667 m/s per pulse/sec
+  anemometerCounter = 0;
+  return speed;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup Wind Speed Input Pin
+  pinMode(ANEMOMETER_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ANEMOMETER_PIN), countAnemometer, FALLING);
+
+  // Setup Wind Direction ADC
+  analogReadResolution(10);
+  analogSetAttenuation(ADC_11db);  // up to 3.6V
+
+  // Turn on sensor if needed
+  pinMode(12, OUTPUT);
+  digitalWrite(12, HIGH);
+
+  // Connect to Wi-Fi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+
+  // Ping check
+  if (Ping.ping("8.8.8.8", 3)) {
+    Serial.println("Internet OK (Ping Success)");
+    internetOK = true;
+  } else {
+    Serial.println("Ping Failed. No Internet.");
+    internetOK = false;
+  }
+
+  // Firebase Initialization
+  if (internetOK) {
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+
+    Serial.print("Authenticating with Firebase");
+    unsigned long startMillis = millis();
+    while (auth.token.uid == "" && millis() - startMillis < 10000) {
+      Serial.print(".");
+      delay(500);
+    }
+
+    if (auth.token.uid != "") {
+      Serial.println("\nFirebase authentication successful!");
+    } else {
+      Serial.println("\nFirebase authentication failed.");
+    }
+  }
+}
+
+void loop() {
+  // Reconnect if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    WiFi.reconnect();
+    delay(2000);
+    return;
+  }
+
+  // Only proceed if connected and Firebase ready
+  if (internetOK && Firebase.ready()) {
+    unsigned long now = millis();
+
+    // --- Wind Speed Calculation & Upload ---
+    if (now > nextCalc) {
+      nextCalc = now + CALC_INTERVAL;
+      windSpeed = readWindSpeed();
+
+      Serial.print("Wind Speed: ");
+      Serial.print(windSpeed);
+      Serial.println(" m/s");
+
+      if (Firebase.RTDB.setFloat(&fbdo, "windSpeed", windSpeed)) {
+        Serial.println("Wind speed uploaded.");
+      } else {
+        Serial.print("Upload error: ");
+        Serial.println(fbdo.errorReason());
+      }
+    }
+
+    // --- Wind Direction Detection & Upload ---
+    int incoming = analogRead(WIND_DIR_PIN);
+    dirIndex = -1;
+
+    for (int i = 0; i < 8; i++) {
+      if (incoming >= sensorMin[i] && incoming <= sensorMax[i]) {
+        dirIndex = i;
+        break;
+      }
+    }
+
+    if (dirIndex != -1) {
+      Serial.print("Direction: ");
+      Serial.println(dirCard[dirIndex]);
+
+      if (Firebase.RTDB.setString(&fbdo, "direction", dirCard[dirIndex])) {
+        Serial.println("Direction uploaded.");
+      } else {
+        Serial.print("Upload error: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      Serial.print("Unknown direction. ADC: ");
+      Serial.println(incoming);
+    }
+  } else {
+    Serial.println("Firebase not ready or internet error.");
+  }
+
+  delay(2000); // Slight delay between reads
+}
